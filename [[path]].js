@@ -1,140 +1,80 @@
-/**
- * Cloudflare Pages Function — Bare Server v3
- * Mounted at /bare/[[path]] — handles all /bare/* requests
- */
+import { connect } from 'cloudflare:sockets';
 
-const BARE_INFO = JSON.stringify({
-  versions: ["v3"],
-  language: "JS",
-  memoryUsage: 0,
-  maintainer: { email: "", website: "" },
-  project: { name: "cf-bare", description: "Bare server for Cloudflare Pages", email: "", website: "", repository: "", version: "1.0.0" },
-});
+const CONTINUE = 0x03, CONNECT = 0x01, DATA = 0x02, CLOSE = 0x04;
+const BUFFER = 128;
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "*",
-  "Access-Control-Allow-Methods": "*",
-  "Access-Control-Expose-Headers": "*",
-};
+function pkt(type, id, payload) {
+  const b = new ArrayBuffer(5 + payload.byteLength);
+  const v = new DataView(b);
+  v.setUint8(0, type);
+  v.setUint32(1, id, true);
+  new Uint8Array(b).set(payload instanceof Uint8Array ? payload : new Uint8Array(payload.buffer ?? payload), 5);
+  return b;
+}
+
+function u32le(n) { const b = new ArrayBuffer(4); new DataView(b).setUint32(0, n, true); return new Uint8Array(b); }
 
 export async function onRequest({ request }) {
-  const url = new URL(request.url);
-  const path = url.pathname;
+  if (request.headers.get('Upgrade') !== 'websocket')
+    return new Response('Wisp server', { status: 200, headers: { 'Access-Control-Allow-Origin': '*' } });
 
-  // Preflight
-  if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: CORS_HEADERS });
-  }
-
-  // Server info
-  if (path === "/bare/" || path === "/bare") {
-    return new Response(BARE_INFO, {
-      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-    });
-  }
-
-  // v3 HTTP proxy
-  if (path.startsWith("/bare/v3/") && request.headers.get("Upgrade") !== "websocket") {
-    return handleHTTP(request);
-  }
-
-  // v3 WebSocket proxy
-  if (path.startsWith("/bare/v3/") && request.headers.get("Upgrade") === "websocket") {
-    return handleWebSocket(request);
-  }
-
-  return new Response("Not Found", { status: 404, headers: CORS_HEADERS });
-}
-
-async function handleHTTP(request) {
-  const targetURL = request.headers.get("X-Bare-URL");
-  if (!targetURL) {
-    return new Response("Missing X-Bare-URL", { status: 400, headers: CORS_HEADERS });
-  }
-
-  let forwardHeaders = {};
-  try {
-    const raw = request.headers.get("X-Bare-Headers");
-    if (raw) forwardHeaders = JSON.parse(raw);
-  } catch {
-    return new Response("Invalid X-Bare-Headers JSON", { status: 400, headers: CORS_HEADERS });
-  }
-
-  let passBody = null;
-  if (!["GET", "HEAD"].includes(request.method)) {
-    passBody = request.body;
-  }
-
-  let response;
-  try {
-    response = await fetch(targetURL, {
-      method: request.method,
-      headers: forwardHeaders,
-      body: passBody,
-      redirect: "manual",
-    });
-  } catch (err) {
-    return new Response(`Upstream error: ${err.message}`, { status: 500, headers: CORS_HEADERS });
-  }
-
-  // Collect response headers for X-Bare-Headers
-  const responseHeadersObj = {};
-  for (const [k, v] of response.headers.entries()) {
-    responseHeadersObj[k] = v;
-  }
-
-  const outHeaders = new Headers(CORS_HEADERS);
-  outHeaders.set("X-Bare-Status", String(response.status));
-  outHeaders.set("X-Bare-Status-Text", response.statusText);
-  outHeaders.set("X-Bare-Headers", JSON.stringify(responseHeadersObj));
-
-  // Forward content-type so the browser renders correctly
-  const ct = response.headers.get("content-type");
-  if (ct) outHeaders.set("Content-Type", ct);
-
-  return new Response(response.body, { status: 200, headers: outHeaders });
-}
-
-async function handleWebSocket(request) {
-  const targetURL = request.headers.get("X-Bare-URL");
-  if (!targetURL) {
-    return new Response("Missing X-Bare-URL", { status: 400, headers: CORS_HEADERS });
-  }
-
-  let extraHeaders = {};
-  try {
-    const raw = request.headers.get("X-Bare-Headers");
-    if (raw) extraHeaders = JSON.parse(raw);
-  } catch { /* ignore */ }
-
-  // Upgrade the request to a WebSocket pair
   const [client, server] = Object.values(new WebSocketPair());
   server.accept();
 
-  // Connect to the target WS
-  const remote = new WebSocket(targetURL, extraHeaders["Sec-WebSocket-Protocol"] ?? []);
+  const streams = new Map();
+  server.send(pkt(CONTINUE, 0, u32le(BUFFER)));
 
-  remote.addEventListener("message", (e) => {
-    try { server.send(e.data); } catch { /* client closed */ }
-  });
-  remote.addEventListener("close", (e) => {
-    try { server.close(e.code, e.reason); } catch { /* already closed */ }
-  });
-  remote.addEventListener("error", () => {
-    try { server.close(1011, "Remote error"); } catch { /* already closed */ }
+  server.addEventListener('message', async ({ data }) => {
+    try {
+      const buf = data instanceof ArrayBuffer ? data : await new Response(data).arrayBuffer();
+      if (buf.byteLength < 5) return;
+      const v = new DataView(buf);
+      const type = v.getUint8(0);
+      const id = v.getUint32(1, true);
+      const payload = buf.slice(5);
+
+      if (type === CONNECT) {
+        const dv = new DataView(payload);
+        const port = dv.getUint16(0, false);
+        const hostname = new TextDecoder().decode(payload.slice(2));
+        const tls = port === 443 || port === 8443;
+        try {
+          const sock = connect({ hostname, port }, { secureTransport: tls ? 'on' : 'off', allowHalfOpen: false });
+          const writer = sock.writable.getWriter();
+          streams.set(id, writer);
+          server.send(pkt(CONTINUE, id, u32le(BUFFER)));
+          (async () => {
+            const reader = sock.readable.getReader();
+            try {
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                try { server.send(pkt(DATA, id, value)); } catch { break; }
+              }
+            } catch {}
+            try { server.send(pkt(CLOSE, id, new Uint8Array([0x02]))); } catch {}
+            streams.delete(id);
+          })();
+        } catch {
+          try { server.send(pkt(CLOSE, id, new Uint8Array([0x03]))); } catch {}
+        }
+      } else if (type === DATA) {
+        const w = streams.get(id);
+        if (w) try {
+          await w.write(new Uint8Array(payload));
+          server.send(pkt(CONTINUE, id, u32le(BUFFER)));
+        } catch { streams.delete(id); }
+      } else if (type === CLOSE) {
+        const w = streams.get(id);
+        if (w) { try { w.close(); } catch {} streams.delete(id); }
+      }
+    } catch {}
   });
 
-  server.addEventListener("message", (e) => {
-    try { remote.send(e.data); } catch { /* remote closed */ }
-  });
-  server.addEventListener("close", (e) => {
-    try { remote.close(e.code, e.reason); } catch { /* already closed */ }
+  server.addEventListener('close', () => {
+    for (const w of streams.values()) try { w.close(); } catch {}
+    streams.clear();
   });
 
-  return new Response(null, {
-    status: 101,
-    webSocket: client,
-    headers: CORS_HEADERS,
-  });
+  return new Response(null, { status: 101, webSocket: client });
 }
