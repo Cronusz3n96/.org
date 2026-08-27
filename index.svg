@@ -5534,6 +5534,11 @@ footer p::before {
           <div class="os-dock-sep"></div>
 <button class="os-dock-btn" onclick="switchTab('settings')" data-tip="Preferences"><img src="https://raw.githubusercontent.com/Cronusz3n96/hhbbhbh/main/image_6.webp" style="border-radius:11px;"></button>
           <button class="os-dock-btn" onclick="switchTab('chat')" data-tip="Live Chat" style="background:#1a1a1a!important;border-color:rgba(194,124,21,0.6)!important;"><i class="fas fa-comments" style="color:#c27c15;font-size:1.1rem;"></i></button>
+          <div class="os-dock-sep"></div>
+          <div id="liveCounter" data-state="loading" title="connecting">
+            <span class="live-counter-dot"></span>
+            <span id="liveCounterValue">...</span>
+          </div>
         </div>
       </div>
 
@@ -12258,6 +12263,42 @@ body {
   margin: 0 4px;
 }
 
+#liveCounter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 50px;
+  padding: 0 12px 0 10px;
+  border-radius: 13px;
+  background: rgba(255,255,255,0.07);
+  font-family: 'Courier New', monospace;
+  font-size: 0.82rem;
+  font-weight: bold;
+  letter-spacing: 1px;
+  color: rgba(255,255,255,0.85);
+  cursor: default;
+  user-select: none;
+}
+
+#liveCounter .live-counter-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #555;
+  box-shadow: none;
+}
+
+#liveCounter[data-state="live"] .live-counter-dot {
+  background: #35d07f;
+  box-shadow: 0 0 8px 2px rgba(53, 208, 127, 0.6);
+  animation: liveCounterPulse 2s ease-in-out infinite;
+}
+
+@keyframes liveCounterPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
 .os-dock-btn {
   width: 50px;
   height: 50px;
@@ -15109,6 +15150,51 @@ document.addEventListener('DOMContentLoaded', function() {
   addMsg(msgsEl,seenIds,'system','ChudPortal2 live chat — be cool, no doxxing, no personal info.',true);
   } // end initChat
 })();
+</script>
+
+<script>
+  // Live site-wide presence counter in the dock (Supabase Realtime presence).
+  (function () {
+    const SB_URL = 'https://udbnojvyaqmtnoywngha.supabase.co';
+    const SB_KEY = 'sb_publishable_-ctB70kQmKV6XE6-wy-l4w_8xr456d0';
+    const STORAGE_KEY = 'sitePresenceId';
+
+    const root = document.getElementById('liveCounter');
+    const valueEl = document.getElementById('liveCounterValue');
+    if (!root || !valueEl || typeof supabase === 'undefined') return;
+
+    let id = '';
+    try { id = sessionStorage.getItem(STORAGE_KEY) || ''; } catch (e) {}
+    if (!id) {
+      id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : 'presence-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+      try { sessionStorage.setItem(STORAGE_KEY, id); } catch (e) {}
+    }
+
+    const channel = supabase.createClient(SB_URL, SB_KEY)
+      .channel('site-presence', { config: { presence: { key: id } } });
+
+    channel
+      .on('presence', { event: 'sync' }, () => {
+        const count = Object.keys(channel.presenceState()).length;
+        root.dataset.state = 'live';
+        valueEl.textContent = new Intl.NumberFormat('en-US').format(count);
+        root.title = count === 1 ? '1 person here right now' : count + ' people here right now';
+      })
+      .subscribe(async status => {
+        if (status === 'SUBSCRIBED') {
+          await channel.track({ online_at: new Date().toISOString() });
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          root.dataset.state = 'loading';
+          root.title = 'reconnecting';
+        }
+      });
+
+    window.addEventListener('pagehide', () => {
+      channel.untrack().catch(() => {});
+    }, { once: true });
+  })();
 </script>
 
 <section id="privacy-section" style="display:none;">
