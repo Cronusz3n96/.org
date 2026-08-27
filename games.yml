@@ -1,0 +1,18 @@
+<script src="https://cdn.jsdelivr.net/gh/Cronusz3n96/stolenstuff@main/noah-js-folder/games.js"></script>
+<script>
+(function() {
+  const BASE = 'https://cronusz3n96.github.io/stolenstuff/';
+  function resolve(u) {
+    if (!u) return u;
+    u = String(u).trim();
+    if (/^https?:\/\//i.test(u)) return u;
+    return BASE + u.replace(/^\//, '');
+  }
+  if (typeof games !== 'undefined' && Array.isArray(games)) {
+    games.forEach(function(g) {
+      if (g.url) g.url = resolve(g.url);
+      if (g.image) g.image = resolve(g.image);
+    });
+  }
+})();
+</script>
